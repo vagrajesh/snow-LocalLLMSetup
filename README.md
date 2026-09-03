@@ -77,3 +77,16 @@ Client callable	❌ Unchecked
 Active	✅ Checked
 Description	Validates a user story has sufficient data before AI test generation runs
 
+
+🔷 COMPONENT 4: AIUsageCostCalculator
+Navigation
+Navigator → Type: "Script Includes"
+Click "New" (or open existing "AIUsageCostCalculator")
+Configuration
+Field	Value
+Name	AIUsageCostCalculator
+API Name	AIUsageCostCalculator (auto-fills)
+Client callable	❌ Unchecked
+Active	✅ Checked
+Description	Calculates token-based cost for cloud LLM generations and provides cost summary reporting
+
