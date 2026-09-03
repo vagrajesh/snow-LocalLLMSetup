@@ -1,0 +1,42 @@
+(function() {
+    var names = [
+        'AITestCaseGenerator',
+        'TestManagementUtils',
+        'AITestGenerationValidator',
+        'AIUsageCostCalculator'
+    ];
+    
+    gs.info('========================================');
+    gs.info('SCRIPT INCLUDE VERIFICATION');
+    gs.info('========================================\n');
+    
+    for (var i = 0; i < names.length; i++) {
+        var gr = new GlideRecord('sys_script_include');
+        gr.addQuery('name', names[i]);
+        gr.query();
+        
+        if (gr.next()) {
+            gs.info('✅ ' + names[i] + ' — Active: ' + gr.getValue('active'));
+        } else {
+            gs.error('❌ ' + names[i] + ' — NOT FOUND');
+        }
+    }
+    
+    // Verify UI Action references the renamed generator
+    var uiaGr = new GlideRecord('sys_ui_action');
+    uiaGr.addQuery('name', 'Generate AI Test Cases');
+    uiaGr.query();
+    
+    if (uiaGr.next()) {
+        var script = uiaGr.getValue('script');
+        if (script.indexOf('new AITestCaseGenerator()') > -1) {
+            gs.info('✅ UI Action references AITestCaseGenerator correctly');
+        } else {
+            gs.error('❌ UI Action does NOT reference AITestCaseGenerator — check script');
+        }
+    } else {
+        gs.error('❌ UI Action "Generate AI Test Cases" NOT FOUND');
+    }
+    
+    gs.info('\n========================================\n');
+})();
