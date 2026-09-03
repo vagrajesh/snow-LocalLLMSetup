@@ -1,0 +1,87 @@
+Navigation
+Navigator → Type: "sys_properties.list"
+Press Enter → Click "New" for each
+
+Property 1: Provider Switch
+Field	Value
+Name	ai.provider
+Type	string
+Value	cloud
+Description	Which AI provider to use: 'cloud' (Azure/OpenAI-compatible cloud API) or 'local' (self-hosted)
+
+Property 2: Cloud Endpoint
+Field	Value
+Name	ai.cloud.endpoint
+Type	string
+Value	https://YOUR-RESOURCE.openai.azure.com
+Description	Cloud LLM provider endpoint (Azure OpenAI or other OpenAI-compatible cloud API)
+
+Property 3: Cloud API Key
+Field	Value
+Name	ai.cloud.api.key
+Type	password2
+Value	YOUR-API-KEY
+Description	API key for cloud LLM provider
+
+Property 4: Cloud Deployment/Model Name
+Field	Value
+Name	ai.cloud.deployment.name
+Type	string
+Value	gpt-4-deployment
+Description	Deployment or model name for cloud provider
+
+Property 5: Cloud API Version
+Field	Value
+Name	ai.cloud.api.version
+Type	string
+Value	2024-02-15-preview
+Description	API version for cloud provider (Azure-specific parameter; ignored by other providers)
+
+Property 6: Local Endpoint
+Field	Value
+Name	ai.local.endpoint
+Type	string
+Value	http://YOUR-SERVER-IP:11434/v1/chat/completions
+Description	Local/self-hosted LLM server endpoint (OpenAI-compatible API)
+
+Property 7: Local Model Name
+Field	Value
+Name	ai.local.model.name
+Type	string
+Value	llama3:70b
+Description	Model name as configured on local LLM server
+
+Property 8: Local MID Server
+Field	Value
+Name	ai.local.mid.server
+Type	string
+Value	(leave blank if not needed)
+Description	MID Server name for reaching on-prem local LLM
+
+Property 9: Local API Key
+Field	Value
+Name	ai.local.api.key
+Type	password2
+Value	YOUR-LOCAL-API-KEY
+Description	API key/token for local LLM server (Bearer auth), if required
+
+Property 10: Shared Timeout
+Field	Value
+Name	ai.timeout
+Type	integer
+Value	120000
+Description	Request timeout in milliseconds (applies to both providers)
+
+Property 11: Test Case Count
+Field	Value
+Name	ai.test.case.count
+Type	integer
+Value	5
+Description	Minimum number of test cases to generate per story
+
+Property 12: Max Retries
+Field	Value
+Name	ai.max.retries
+Type	integer
+Value	3
+Description	Number of retry attempts on connection failure
