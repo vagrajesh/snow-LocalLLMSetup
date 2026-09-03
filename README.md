@@ -53,3 +53,27 @@ List context menu	❌ Unchecked
 Client	❌ Unchecked (Server-side)
 Order	100
 
+Optional: Condition Script (Control When Button Shows)
+
+If desired, add this in the Condition field of the UI Action:
+
+javascript
+// Show button only if story has title and description
+answer = !current.short_description.nil() && !current.description.nil();
+
+Optional: Restrict by Role
+Navigate to: UI Actions → Generate AI Test Cases → Roles (related list at bottom)
+Add roles: admin, test_admin, test_manager
+
+COMPONENT 3: AITestGenerationValidator
+Navigation
+Navigator → Type: "Script Includes"
+Click "New" (or open existing "AITestGenerationValidator")
+Configuration
+Field	Value
+Name	AITestGenerationValidator
+API Name	AITestGenerationValidator (auto-fills)
+Client callable	❌ Unchecked
+Active	✅ Checked
+Description	Validates a user story has sufficient data before AI test generation runs
+
