@@ -1,0 +1,825 @@
+var AITestCaseGenerator = Class.create();
+AITestCaseGenerator.prototype = {
+    
+    /**
+     * Initialize the generator with configuration from system properties
+     */
+    initialize: function() {
+        // Provider selection
+        this.PROVIDER = gs.getProperty('ai.provider', 'cloud'); // 'cloud' or 'local'
+        
+        // Cloud Provider Configuration (Azure OpenAI or other OpenAI-compatible cloud API)
+        this.CLOUD_ENDPOINT = gs.getProperty('ai.cloud.endpoint');
+        this.CLOUD_API_KEY = gs.getProperty('ai.cloud.api.key');
+        this.CLOUD_DEPLOYMENT_NAME = gs.getProperty('ai.cloud.deployment.name');
+        this.CLOUD_API_VERSION = gs.getProperty('ai.cloud.api.version', '2024-02-15-preview');
+        
+        // Local Provider Configuration
+        this.LOCAL_ENDPOINT = gs.getProperty('ai.local.endpoint');
+        this.LOCAL_MODEL_NAME = gs.getProperty('ai.local.model.name');
+        this.LOCAL_MID_SERVER = gs.getProperty('ai.local.mid.server', '');
+        this.LOCAL_API_KEY = gs.getProperty('ai.local.api.key', '');
+        
+        // Shared Configuration
+        this.TIMEOUT = parseInt(gs.getProperty('ai.timeout', '120000'));
+        this.TEST_CASE_COUNT = parseInt(gs.getProperty('ai.test.case.count', '5'));
+        this.MAX_RETRIES = parseInt(gs.getProperty('ai.max.retries', '3'));
+        
+        // Logging prefix
+        this.LOG_PREFIX = 'AITestCaseGenerator';
+        
+        // Validate configuration
+        this._validateConfiguration();
+    },
+    
+    /**
+     * Validate that all required configuration is present based on active provider
+     * @returns {Object} - {valid: boolean, errors: []}
+     */
+    _validateConfiguration: function() {
+        var errors = [];
+        
+        if (this.PROVIDER === 'cloud') {
+            if (!this.CLOUD_ENDPOINT) errors.push('Cloud endpoint not configured (ai.cloud.endpoint)');
+            if (!this.CLOUD_API_KEY) errors.push('Cloud API key not configured (ai.cloud.api.key)');
+            if (!this.CLOUD_DEPLOYMENT_NAME) errors.push('Cloud deployment name not configured (ai.cloud.deployment.name)');
+            
+        } else if (this.PROVIDER === 'local') {
+            if (!this.LOCAL_ENDPOINT) errors.push('Local LLM endpoint not configured (ai.local.endpoint)');
+            if (!this.LOCAL_MODEL_NAME) errors.push('Local LLM model name not configured (ai.local.model.name)');
+            if (!this.LOCAL_API_KEY) {
+                gs.warn(this.LOG_PREFIX + ': No ai.local.api.key set — proceeding without auth header (OK if your server doesn\'t require one)');
+            }
+            
+        } else {
+            errors.push('Invalid ai.provider value: "' + this.PROVIDER + '". Must be "cloud" or "local"');
+        }
+        
+        if (errors.length > 0) {
+            gs.error(this.LOG_PREFIX + ': Configuration errors: ' + errors.join(', '));
+            return { valid: false, errors: errors };
+        }
+        
+        gs.debug(this.LOG_PREFIX + ': Configuration validated successfully (provider: ' + this.PROVIDER + ')');
+        return { valid: true, errors: [] };
+    },
+    
+    /**
+     * Main entry point - Generate test cases for a user story
+     * @param {String} storyId - User story sys_id
+     * @returns {Object} - {success, message, totalGenerated, results}
+     */
+    generateTestCases: function(storyId) {
+        var startTime = new Date().getTime();
+        
+        try {
+            gs.info(this.LOG_PREFIX + ': Starting test case generation for story: ' + storyId + 
+                    ' using provider: ' + this.PROVIDER);
+            
+            var configValidation = this._validateConfiguration();
+            if (!configValidation.valid) {
+                return this._buildFailureResult('Configuration error: ' + configValidation.errors.join(', '));
+            }
+            
+            var storyResult = this._getUserStory(storyId);
+            if (!storyResult.success) {
+                return this._buildFailureResult(storyResult.message);
+            }
+            
+            var story = storyResult.data;
+            
+            var validator = new AITestGenerationValidator();
+            var validation = validator.validateStory(story);
+            
+            if (!validation.valid) {
+                return this._buildFailureResult('Story validation failed: ' + validation.errors.join(', '));
+            }
+            
+            var prompts = this._buildPrompt(story);
+            if (!prompts) {
+                return this._buildFailureResult('Failed to build AI prompt');
+            }
+            
+            // Route to correct provider
+            gs.info(this.LOG_PREFIX + ': Calling ' + this.PROVIDER + ' LLM API...');
+            var apiResult = (this.PROVIDER === 'local') ? 
+                this._callLocalLLM(prompts) : 
+                this._callCloudLLM(prompts);
+            
+            if (!apiResult.success) {
+                var duration1 = Math.round((new Date().getTime() - startTime) / 1000);
+                var failResult = this._buildFailureResult(apiResult.message);
+                this._logGeneration(storyId, failResult, duration1, null);
+                return failResult;
+            }
+            
+            gs.info(this.LOG_PREFIX + ': Parsing AI response...');
+            var aiData = this._parseAIResponse(apiResult.data);
+            
+            if (!aiData || !aiData.test_cases) {
+                var duration2 = Math.round((new Date().getTime() - startTime) / 1000);
+                var parseFailResult = this._buildFailureResult('Failed to parse AI response');
+                this._logGeneration(storyId, parseFailResult, duration2, apiResult.rawResponse);
+                return parseFailResult;
+            }
+            
+            gs.info(this.LOG_PREFIX + ': Creating test cases in ServiceNow...');
+            var createResult = this._createTestCases(aiData, storyId);
+            
+            var duration = Math.round((new Date().getTime() - startTime) / 1000);
+            this._logGeneration(storyId, createResult, duration, apiResult.rawResponse);
+            
+            var finalResult = {
+                success: createResult.success,
+                message: createResult.success ? 
+                    'Successfully generated ' + createResult.successCount + ' of ' + 
+                    (createResult.successCount + createResult.failureCount) + ' test cases (via ' + this.PROVIDER + ')' :
+                    'Failed to generate test cases: ' + createResult.message,
+                totalGenerated: createResult.successCount,
+                successCount: createResult.successCount,
+                failureCount: createResult.failureCount,
+                createdTests: createResult.createdTests,
+                duration: duration,
+                storyId: storyId,
+                provider: this.PROVIDER
+            };
+            
+            gs.info(this.LOG_PREFIX + ': Generation complete in ' + duration + ' seconds using ' + this.PROVIDER);
+            return finalResult;
+            
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + '.generateTestCases: ' + e);
+            var duration3 = Math.round((new Date().getTime() - startTime) / 1000);
+            var errorResult = this._buildFailureResult('Exception: ' + e);
+            this._logGeneration(storyId, errorResult, duration3, null);
+            return errorResult;
+        }
+    },
+    
+    /**
+     * Helper to build a standard failure result object
+     */
+    _buildFailureResult: function(message) {
+        return {
+            success: false,
+            message: message,
+            totalGenerated: 0,
+            successCount: 0,
+            failureCount: 0,
+            createdTests: []
+        };
+    },
+    
+    /**
+     * Retrieve user story from database
+     */
+    _getUserStory: function(storyId) {
+        try {
+            var storyGr = new GlideRecord('rm_story');
+            
+            if (!storyGr.get(storyId)) {
+                return { success: false, message: 'User story not found: ' + storyId, data: null };
+            }
+            
+            var story = {
+                sys_id: storyGr.getUniqueValue(),
+                number: storyGr.getValue('number'),
+                short_description: storyGr.getValue('short_description'),
+                description: storyGr.getValue('description'),
+                acceptance_criteria: storyGr.getValue('acceptance_criteria'),
+                priority: storyGr.getDisplayValue('priority'),
+                state: storyGr.getDisplayValue('state'),
+                application: storyGr.getValue('application'),
+                application_name: storyGr.getDisplayValue('application')
+            };
+            
+            gs.debug(this.LOG_PREFIX + ': Retrieved story: ' + story.number);
+            return { success: true, data: story, message: 'Story retrieved successfully' };
+            
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + '._getUserStory: ' + e);
+            return { success: false, message: 'Error retrieving story: ' + e, data: null };
+        }
+    },
+    
+    /**
+     * Build AI prompts from user story data
+     */
+    _buildPrompt: function(story) {
+        try {
+            var storyNumber = story.number || 'N/A';
+            var storyTitle = story.short_description || 'Untitled Story';
+            var storyDescription = this._cleanText(story.description || 'No description provided');
+            var acceptanceCriteria = this._cleanText(story.acceptance_criteria || 'No acceptance criteria provided');
+            var application = story.application_name || 'Not specified';
+            var priority = story.priority || 'Medium';
+            
+            var systemPrompt = 
+                "You are an expert Quality Assurance test case generator for ServiceNow Test Management 2.0. " +
+                "Your role is to create comprehensive, detailed, and professional test cases from user stories. " +
+                "\n\n**YOUR EXPERTISE:**\n" +
+                "- Deep knowledge of software testing methodologies (positive, negative, edge cases, boundary conditions)\n" +
+                "- Understanding of user story format and acceptance criteria\n" +
+                "- Expertise in test case structure and best practices\n" +
+                "- Ability to identify all critical test scenarios\n\n" +
+                "**YOUR OUTPUT:**\n" +
+                "- Must be valid JSON only (no markdown, no code blocks, no explanations)\n" +
+                "- Must follow the exact structure provided\n" +
+                "- Must include diverse test scenarios (happy path, negative, edge cases)\n" +
+                "- Test steps must be clear, actionable, and use imperative verbs\n" +
+                "- Expected results must be specific and measurable\n\n" +
+                "**QUALITY STANDARDS:**\n" +
+                "- Professional language and formatting\n" +
+                "- Comprehensive coverage of acceptance criteria\n" +
+                "- Clear, unambiguous test steps\n" +
+                "- Realistic test data examples\n" +
+                "- Logical step ordering (increments of 100)\n\n" +
+                "Generate test cases that a professional QA engineer would create.";
+            
+            // Add reasoning suppression instruction for local models
+            if (this.PROVIDER === 'local') {
+                systemPrompt += "\n\n**CRITICAL OUTPUT CONSTRAINT:**\n" +
+                    "Do NOT include any <think>, <thinking>, or <reasoning> tags in your output. " +
+                    "Do NOT explain your reasoning process or show your thought process. " +
+                    "Respond with ONLY the raw JSON object - no preamble, no explanation, " +
+                    "no tags, nothing before or after the JSON.";
+            }
+            
+            var userPrompt = 
+                "Generate comprehensive test cases for the following user story:\n\n" +
+                "**USER STORY INFORMATION:**\n" +
+                "─────────────────────────────────────────────────────────────\n" +
+                "Story Number:     " + storyNumber + "\n" +
+                "Story Title:      " + storyTitle + "\n\n" +
+                "Description:\n" + storyDescription + "\n\n" +
+                "Acceptance Criteria:\n" + acceptanceCriteria + "\n\n" +
+                "Application:      " + application + "\n" +
+                "Priority:         " + priority + "\n" +
+                "─────────────────────────────────────────────────────────────\n\n" +
+                "**REQUIREMENTS:**\n" +
+                "- Generate at least " + this.TEST_CASE_COUNT + " test cases minimum\n" +
+                "- Each test case should have 3-8 steps\n" +
+                "- Step order MUST increment by 100 (100, 200, 300, etc.)\n" +
+                "- Cover positive scenarios, negative scenarios, edge cases, and boundary conditions\n" +
+                "- Use imperative verbs for steps (Navigate, Click, Enter, Verify, Select, etc.)\n" +
+                "- Include realistic test data where applicable\n\n" +
+                "**CRITICAL FIELD MAPPING RULES:**\n" +
+                "1. testData.short_description AND versionData.short_description MUST be IDENTICAL\n" +
+                "2. Both should contain: Brief one-line summary of what the TEST validates\n" +
+                "3. Example: \"Verify user can login with valid credentials\"\n" +
+                "4. DO NOT use generic text like \"Version 1.0\" for versionData.short_description\n\n" +
+                "**OUTPUT FORMAT (Valid JSON Only):**\n" +
+                "{\n" +
+                "  \"test_cases\": [\n" +
+                "    {\n" +
+                "      \"testData\": {\n" +
+                "        \"name\": \"Test - Brief descriptive name\",\n" +
+                "        \"short_description\": \"One-line summary of what this test validates\",\n" +
+                "        \"description\": \"Detailed description of test purpose and scope\",\n" +
+                "        \"test_type\": \"functional\",\n" +
+                "        \"priority\": \"High\",\n" +
+                "        \"state\": \"draft\"\n" +
+                "      },\n" +
+                "      \"versionData\": {\n" +
+                "        \"version\": \"1.0\",\n" +
+                "        \"short_description\": \"SAME as testData.short_description\",\n" +
+                "        \"description\": \"Version 1.0 - Initial test version\",\n" +
+                "        \"state\": \"draft\",\n" +
+                "        \"priority\": \"High\"\n" +
+                "      },\n" +
+                "      \"stepsData\": [\n" +
+                "        {\n" +
+                "          \"order\": 100,\n" +
+                "          \"step\": \"Navigate to [specific page/screen]\",\n" +
+                "          \"expected_result\": \"[Specific expected outcome]\",\n" +
+                "          \"test_data\": \"[Relevant test data if applicable]\",\n" +
+                "          \"description\": \"[Optional additional context]\"\n" +
+                "        }\n" +
+                "      ]\n" +
+                "    }\n" +
+                "  ]\n" +
+                "}\n\n" +
+                "**TEST SCENARIO COVERAGE:**\n" +
+                "1. Happy Path: Standard successful flow\n" +
+                "2. Negative Cases: Invalid inputs, missing fields, unauthorized access\n" +
+                "3. Edge Cases: Boundary values, special characters, maximum lengths\n" +
+                "4. Integration Points: Interaction with other system components\n" +
+                "5. Error Handling: How system responds to errors\n\n" +
+                "**REMEMBER:**\n" +
+                "- Output ONLY valid JSON (no markdown code blocks)\n" +
+                "- testData.short_description MUST equal versionData.short_description\n" +
+                "- Step order increments by 100\n" +
+                "- Be specific and actionable\n\n" +
+                "Generate the test cases now.";
+            
+            return { system: systemPrompt, user: userPrompt };
+            
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + '._buildPrompt: ' + e);
+            return null;
+        }
+    },
+    
+    /**
+     * Clean text - remove excess whitespace and line breaks
+     */
+    _cleanText: function(text) {
+        if (!text) return '';
+        text = text.replace(/\s+/g, ' ');
+        text = text.replace(/\n{3,}/g, '\n\n');
+        return text.trim();
+    },
+    
+    /**
+     * Call cloud LLM API (Azure OpenAI or other OpenAI-compatible cloud provider) with retry logic
+     */
+    _callCloudLLM: function(prompts) {
+        var baseDelay = 2000;
+        
+        for (var attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
+            try {
+                gs.info(this.LOG_PREFIX + ': Cloud API Call Attempt ' + attempt + ' of ' + this.MAX_RETRIES);
+                
+                var endpoint = this.CLOUD_ENDPOINT + 
+                              '/openai/deployments/' + this.CLOUD_DEPLOYMENT_NAME + 
+                              '/chat/completions?api-version=' + this.CLOUD_API_VERSION;
+                
+                var request = new sn_ws.RESTMessageV2();
+                request.setEndpoint(endpoint);
+                request.setHttpMethod('POST');
+                request.setRequestHeader('Content-Type', 'application/json');
+                request.setRequestHeader('api-key', this.CLOUD_API_KEY);
+                request.setHttpTimeout(this.TIMEOUT);
+                
+                var payload = {
+                    messages: [
+                        { role: 'system', content: prompts.system },
+                        { role: 'user', content: prompts.user }
+                    ],
+                    temperature: 0.7,
+                    max_tokens: 4000,
+                    response_format: { type: 'json_object' }
+                };
+                
+                request.setRequestBody(JSON.stringify(payload));
+                
+                var response = request.execute();
+                var statusCode = response.getStatusCode();
+                var responseBody = response.getBody();
+                var errorMessage = response.getErrorMessage();
+                
+                gs.info(this.LOG_PREFIX + ': API Response Status: ' + statusCode);
+                
+                if (statusCode == 0) {
+                    gs.error(this.LOG_PREFIX + ': Status Code 0 (attempt ' + attempt + '): ' + (errorMessage || 'No details'));
+                    
+                    if (attempt < this.MAX_RETRIES) {
+                        this._wait(baseDelay * Math.pow(2, attempt - 1));
+                        continue;
+                    }
+                    return { success: false, message: 'Cloud provider connection failed after ' + this.MAX_RETRIES + 
+                             ' attempts (Status 0). Error: ' + (errorMessage || 'No details') };
+                }
+                
+                if (statusCode == 429) {
+                    if (attempt < this.MAX_RETRIES) {
+                        gs.warn(this.LOG_PREFIX + ': Rate limited, retrying...');
+                        this._wait(5000 * attempt);
+                        continue;
+                    }
+                }
+                
+                if (statusCode == 200) {
+                    var responseObj = JSON.parse(responseBody);
+                    var content = responseObj.choices[0].message.content;
+                    var usage = responseObj.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+                    
+                    gs.info(this.LOG_PREFIX + ': Token Usage - Prompt: ' + usage.prompt_tokens + 
+                           ', Completion: ' + usage.completion_tokens + ', Total: ' + usage.total_tokens);
+                    
+                    return { success: true, data: content, usage: usage, rawResponse: responseObj };
+                }
+                
+                gs.error(this.LOG_PREFIX + ': API Error ' + statusCode + ': ' + responseBody);
+                return { success: false, message: 'API returned status ' + statusCode + ': ' + responseBody };
+                
+            } catch (e) {
+                gs.error(this.LOG_PREFIX + '._callCloudLLM attempt ' + attempt + ': ' + e);
+                if (attempt < this.MAX_RETRIES) {
+                    this._wait(baseDelay * attempt);
+                    continue;
+                }
+                return { success: false, message: 'Exception after ' + this.MAX_RETRIES + ' attempts: ' + e };
+            }
+        }
+        
+        return { success: false, message: 'Unexpected error: max retries exceeded' };
+    },
+    
+    /**
+     * Call Local LLM API (Ollama/vLLM/LM Studio - OpenAI-compatible)
+     */
+    _callLocalLLM: function(prompts) {
+        var baseDelay = 2000;
+        
+        for (var attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
+            try {
+                gs.info(this.LOG_PREFIX + ': Local LLM Call Attempt ' + attempt + ' of ' + this.MAX_RETRIES);
+                gs.debug(this.LOG_PREFIX + ': Endpoint: ' + this.LOCAL_ENDPOINT);
+                gs.debug(this.LOG_PREFIX + ': Model: ' + this.LOCAL_MODEL_NAME);
+                
+                var request = new sn_ws.RESTMessageV2();
+                request.setEndpoint(this.LOCAL_ENDPOINT);
+                request.setHttpMethod('POST');
+                request.setRequestHeader('Content-Type', 'application/json');
+                request.setHttpTimeout(this.TIMEOUT);
+                
+                // Add Authorization header if API key is configured
+                if (this.LOCAL_API_KEY) {
+                    request.setRequestHeader('Authorization', 'Bearer ' + this.LOCAL_API_KEY);
+                    gs.debug(this.LOG_PREFIX + ': Authorization header set for local LLM');
+                }
+                
+                // Use MID Server if configured (for on-prem reachability)
+                if (this.LOCAL_MID_SERVER) {
+                    request.setMIDServer(this.LOCAL_MID_SERVER);
+                    gs.debug(this.LOG_PREFIX + ': Using MID Server: ' + this.LOCAL_MID_SERVER);
+                }
+                
+                var payload = {
+                    model: this.LOCAL_MODEL_NAME,
+                    messages: [
+                        { role: 'system', content: prompts.system },
+                        { role: 'user', content: prompts.user }
+                    ],
+                    temperature: 0.7,
+                    max_tokens: 4000
+                    // NOTE: response_format not universally supported by local servers
+                };
+                
+                request.setRequestBody(JSON.stringify(payload));
+                
+                var response = request.execute();
+                var statusCode = response.getStatusCode();
+                var responseBody = response.getBody();
+                var errorMessage = response.getErrorMessage();
+                
+                gs.info(this.LOG_PREFIX + ': Local LLM Response Status: ' + statusCode);
+                
+                if (statusCode == 0) {
+                    gs.error(this.LOG_PREFIX + ': Status Code 0 (attempt ' + attempt + '): ' + (errorMessage || 'No details'));
+                    gs.error(this.LOG_PREFIX + ': Check: 1) Server reachable 2) MID Server up 3) Firewall/port open');
+                    
+                    if (attempt < this.MAX_RETRIES) {
+                        this._wait(baseDelay * Math.pow(2, attempt - 1));
+                        continue;
+                    }
+                    return { success: false, message: 'Local LLM connection failed after ' + this.MAX_RETRIES + 
+                             ' attempts (Status 0). Verify endpoint/MID Server/network path.' };
+                }
+                
+                if (statusCode == 401 || statusCode == 403) {
+                    gs.error(this.LOG_PREFIX + ': Authentication failed (status ' + statusCode + '). Check ai.local.api.key value.');
+                    return { success: false, message: 'Local LLM authentication failed (status ' + statusCode + 
+                             '). Verify ai.local.api.key is correct.' };
+                }
+                
+                if (statusCode == 200) {
+                    var responseObj = JSON.parse(responseBody);
+                    var content = responseObj.choices[0].message.content;
+                    
+                    // Local servers vary on whether they return usage stats
+                    var usage = responseObj.usage;
+                    if (!usage) {
+                        usage = {
+                            prompt_tokens: this._estimateTokens(prompts.system + prompts.user),
+                            completion_tokens: this._estimateTokens(content),
+                            total_tokens: 0
+                        };
+                        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                        gs.warn(this.LOG_PREFIX + ': Local server did not return usage stats - using estimates');
+                    }
+                    
+                    gs.info(this.LOG_PREFIX + ': Token Usage (estimated if needed) - Total: ' + usage.total_tokens);
+                    
+                    return { success: true, data: content, usage: usage, rawResponse: responseObj };
+                }
+                
+                gs.error(this.LOG_PREFIX + ': Local LLM Error ' + statusCode + ': ' + responseBody);
+                return { success: false, message: 'Local LLM returned status ' + statusCode + ': ' + responseBody };
+                
+            } catch (e) {
+                gs.error(this.LOG_PREFIX + '._callLocalLLM attempt ' + attempt + ': ' + e);
+                if (attempt < this.MAX_RETRIES) {
+                    this._wait(baseDelay * attempt);
+                    continue;
+                }
+                return { success: false, message: 'Exception after ' + this.MAX_RETRIES + ' attempts: ' + e };
+            }
+        }
+        
+        return { success: false, message: 'Unexpected error: max retries exceeded' };
+    },
+    
+    /**
+     * Busy-wait helper (ServiceNow has no native sleep)
+     */
+    _wait: function(delayMs) {
+        gs.warn(this.LOG_PREFIX + ': Waiting ' + delayMs + 'ms before retry...');
+        var waitStart = new Date().getTime();
+        while (new Date().getTime() - waitStart < delayMs) {
+            // Busy wait
+        }
+    },
+    
+    /**
+     * Rough token estimator fallback (~4 chars per token)
+     */
+    _estimateTokens: function(text) {
+        return Math.ceil((text || '').length / 4);
+    },
+    
+    /**
+     * Strip reasoning/thinking tags from local LLM responses
+     */
+    _stripReasoningTags: function(content) {
+        if (!content) return '';
+        
+        var cleaned = content;
+        
+        cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '');
+        cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+        cleaned = cleaned.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '');
+        
+        // Handle UNCLOSED think tags (truncated response)
+        if (/<think>/i.test(cleaned) && !/<\/think>/i.test(cleaned)) {
+            gs.error(this.LOG_PREFIX + ': WARNING - Unclosed <think> tag. Response likely truncated. ' +
+                     'Consider increasing max_tokens.');
+            
+            var lastThinkIndex = cleaned.toLowerCase().lastIndexOf('<think>');
+            var afterThink = cleaned.substring(lastThinkIndex + 7);
+            
+            if (afterThink.indexOf('{') > -1) {
+                cleaned = afterThink;
+            }
+        }
+        
+        cleaned = cleaned.replace(/```json\n?/gi, '');
+        cleaned = cleaned.replace(/```\n?/g, '');
+        
+        return cleaned.trim();
+    },
+    
+    /**
+     * Extract JSON object from mixed content (reasoning + JSON)
+     */
+    _extractJsonObject: function(content) {
+        if (!content) return null;
+        
+        var cleaned = this._stripReasoningTags(content);
+        
+        var firstBrace = cleaned.indexOf('{');
+        var lastBrace = cleaned.lastIndexOf('}');
+        
+        if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+            gs.error(this.LOG_PREFIX + ': No JSON object boundaries found in response');
+            return null;
+        }
+        
+        var candidate = cleaned.substring(firstBrace, lastBrace + 1);
+        
+        try {
+            JSON.parse(candidate);
+            return candidate;
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + ': Extracted content is not valid JSON: ' + e);
+            return null;
+        }
+    },
+    
+    /**
+     * Parse AI response into structured data (handles both cloud and local LLM formats)
+     */
+    _parseAIResponse: function(content) {
+        try {
+            gs.debug(this.LOG_PREFIX + ': Parsing AI response...');
+            
+            var jsonString = this._extractJsonObject(content);
+            
+            if (!jsonString) {
+                gs.error(this.LOG_PREFIX + ': Could not extract valid JSON from response');
+                gs.error(this.LOG_PREFIX + ': Raw content (first 500 chars): ' + content.substring(0, 500));
+                return null;
+            }
+            
+            var parsed = JSON.parse(jsonString);
+            
+            if (!parsed.test_cases || !Array.isArray(parsed.test_cases)) {
+                gs.error(this.LOG_PREFIX + ': Invalid response structure - missing test_cases array');
+                return null;
+            }
+            
+            gs.info(this.LOG_PREFIX + ': Successfully parsed ' + parsed.test_cases.length + ' test cases');
+            return parsed;
+            
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + '._parseAIResponse: ' + e);
+            gs.error(this.LOG_PREFIX + ': Failed to parse content: ' + content.substring(0, 500));
+            return null;
+        }
+    },
+    
+    /**
+     * Create test cases from AI response
+     */
+    _createTestCases: function(aiData, storyId) {
+        var createdTests = [];
+        var successCount = 0;
+        var failureCount = 0;
+        
+        if (!aiData || !aiData.test_cases || aiData.test_cases.length === 0) {
+            return { success: false, successCount: 0, failureCount: 0, 
+                     message: 'No test cases in AI response', createdTests: [] };
+        }
+        
+        var storyNumber = '';
+        var storyTitle = '';
+        var storyGr = new GlideRecord('rm_story');
+        if (storyGr.get(storyId)) {
+            storyNumber = storyGr.getValue('number');
+            storyTitle = storyGr.getValue('short_description');
+            gs.info(this.LOG_PREFIX + ': Creating tests for story ' + storyNumber + ' (' + storyId + ')');
+        }
+        
+        for (var i = 0; i < aiData.test_cases.length; i++) {
+            var testCase = aiData.test_cases[i];
+            
+            try {
+                var testData = {
+                    name: testCase.testData.name,
+                    short_description: testCase.testData.short_description,
+                    description: testCase.testData.description || '',
+                    test_type: testCase.testData.test_type || 'functional',
+                    priority: this._mapPriority(testCase.testData.priority),
+                    state: testCase.testData.state || 'draft'
+                };
+                
+                if (storyNumber) {
+                    testData.description = 
+                        'Generated from User Story: ' + storyNumber + ' - ' + storyTitle + 
+                        ' (via ' + this.PROVIDER + ')\n\n' + testData.description;
+                }
+                
+                var versionData = {
+                    version: testCase.versionData.version || '1.0',
+                    short_description: testCase.versionData.short_description,
+                    description: testCase.versionData.description || '',
+                    state: testCase.versionData.state || 'draft',
+                    priority: this._mapPriority(testCase.versionData.priority)
+                };
+                
+                var stepsData = testCase.stepsData || [];
+                
+                var utils = new TestManagementUtils();
+                var result = utils.createCompleteTest(testData, versionData, stepsData, storyId);
+                
+                if (result.success) {
+                    successCount++;
+                    createdTests.push({
+                        testId: result.testId,
+                        versionId: result.versionId,
+                        stepIds: result.stepIds,
+                        m2mId: result.m2mId,
+                        testName: testData.name,
+                        linkedToStory: storyId
+                    });
+                    gs.info(this.LOG_PREFIX + ': ✅ Created and linked test: ' + testData.name);
+                } else {
+                    failureCount++;
+                    gs.error(this.LOG_PREFIX + ': ❌ Failed to create test: ' + result.message);
+                }
+                
+            } catch (e) {
+                failureCount++;
+                gs.error(this.LOG_PREFIX + ': Error creating test case: ' + e);
+            }
+        }
+        
+        this._verifyStoryLinkage(storyId, createdTests);
+        
+        return {
+            success: successCount > 0,
+            successCount: successCount,
+            failureCount: failureCount,
+            createdTests: createdTests,
+            storyId: storyId,
+            message: successCount > 0 ? 
+                'Created ' + successCount + ' test cases successfully' :
+                'Failed to create any test cases'
+        };
+    },
+    
+    /**
+     * Verify that tests are properly linked to story via M2M table
+     */
+    _verifyStoryLinkage: function(storyId, createdTests) {
+        try {
+            gs.info(this.LOG_PREFIX + ': Verifying story linkage via M2M...');
+            
+            var m2mTable = 'sn_test_management_m2m_task_test';
+            var m2mGr = new GlideRecord(m2mTable);
+            m2mGr.addQuery('task', storyId);
+            m2mGr.query();
+            var linkedCount = m2mGr.getRowCount();
+            
+            gs.info(this.LOG_PREFIX + ': ✅ Total M2M links for this story: ' + linkedCount);
+            
+            for (var i = 0; i < createdTests.length; i++) {
+                var test = createdTests[i];
+                var checkGr = new GlideRecord(m2mTable);
+                checkGr.addQuery('task', storyId);
+                checkGr.addQuery('test', test.testId);
+                checkGr.query();
+                
+                if (checkGr.next()) {
+                    gs.debug(this.LOG_PREFIX + ':   ✅ ' + test.testName + ' → Linked via M2M');
+                } else {
+                    gs.error(this.LOG_PREFIX + ':   ❌ ' + test.testName + ' → M2M link MISSING');
+                }
+            }
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + '._verifyStoryLinkage: ' + e);
+        }
+    },
+    
+    /**
+     * Map priority from various formats to ServiceNow values
+     */
+    _mapPriority: function(priority) {
+        if (!priority) return 'Medium';
+        
+        var priorityStr = String(priority).toLowerCase().trim();
+        
+        var priorityMap = {
+            'high': 'High', '1': 'High', 'critical': 'High', 'urgent': 'High',
+            'medium': 'Medium', '2': 'Medium', '3': 'Medium', 'normal': 'Medium', 'moderate': 'Medium',
+            'low': 'Low', '4': 'Low', '5': 'Low', 'minor': 'Low'
+        };
+        
+        return priorityMap[priorityStr] || 'Medium';
+    },
+    
+    /**
+     * Log generation attempt with cost tracking (handles $0 cost for local LLM)
+     */
+    _logGeneration: function(storyId, result, duration, apiResponse) {
+        try {
+            var logGr = new GlideRecord('u_ai_test_generation_log');
+            logGr.initialize();
+            
+            logGr.setValue('u_story', storyId);
+            logGr.setValue('u_generated_at', new GlideDateTime());
+            logGr.setValue('u_success', result.success);
+            logGr.setValue('u_test_count', result.successCount || 0);
+            logGr.setValue('u_failed_count', result.failureCount || 0);
+            logGr.setValue('u_error_message', result.message || '');
+            logGr.setValue('u_generated_by', gs.getUserID());
+            logGr.setValue('u_duration_seconds', duration);
+            
+            if (apiResponse && apiResponse.usage) {
+                var usage = apiResponse.usage;
+                
+                logGr.setValue('u_input_tokens', usage.prompt_tokens || 0);
+                logGr.setValue('u_output_tokens', usage.completion_tokens || 0);
+                logGr.setValue('u_total_tokens', usage.total_tokens || 0);
+                logGr.setValue('u_model', (this.PROVIDER === 'local') ? this.LOCAL_MODEL_NAME : this.CLOUD_DEPLOYMENT_NAME);
+                
+                if (this.PROVIDER === 'local') {
+                    logGr.setValue('u_input_cost', 0);
+                    logGr.setValue('u_output_cost', 0);
+                    logGr.setValue('u_estimated_cost', 0);
+                    gs.info(this.LOG_PREFIX + ': Local LLM generation - $0 API cost (self-hosted)');
+                } else {
+                    var costCalc = new AIUsageCostCalculator();
+                    var cost = costCalc.calculateCost(
+                        usage.prompt_tokens || 0, usage.completion_tokens || 0, this.CLOUD_DEPLOYMENT_NAME
+                    );
+                    
+                    logGr.setValue('u_input_cost', cost.inputCost);
+                    logGr.setValue('u_output_cost', cost.outputCost);
+                    logGr.setValue('u_estimated_cost', cost.totalCost);
+                    
+                    gs.info(this.LOG_PREFIX + ': Cost for this generation: $' + cost.totalCost);
+                }
+            }
+            
+            logGr.insert();
+            gs.debug(this.LOG_PREFIX + ': Generation logged successfully');
+            
+        } catch (e) {
+            gs.error(this.LOG_PREFIX + '._logGeneration: ' + e);
+        }
+    },
+    
+    type: 'AITestCaseGenerator'
+};
